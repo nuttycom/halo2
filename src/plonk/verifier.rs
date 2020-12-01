@@ -44,6 +44,15 @@ impl<'a, C: CurveAffine> Proof<C> {
                 .map_err(|_| Error::TranscriptError)?;
         }
 
+        // Sample theta challenge for keeping lookup columns linearly independent
+        let theta: C::Scalar =
+            get_challenge_scalar(Challenge(transcript.squeeze().get_lower_128()));
+
+        for lookup in &self.lookup_proofs {
+            hash_point(&mut transcript, &lookup.permuted_input_commitment)?;
+            hash_point(&mut transcript, &lookup.permuted_table_commitment)?;
+        }
+
         // Sample beta challenge
         let beta = ChallengeBeta::get(&mut transcript);
 
@@ -53,6 +62,11 @@ impl<'a, C: CurveAffine> Proof<C> {
         // Hash each permutation product commitment
         if let Some(p) = &self.permutations {
             p.absorb_commitments(&mut transcript)?;
+        }
+
+        // Hash each lookup product commitment
+        for lookup in &self.lookup_proofs {
+            hash_point(&mut transcript, &lookup.product_commitment)?;
         }
 
         // Sample y challenge, which keeps the gates linearly independent.
@@ -71,7 +85,7 @@ impl<'a, C: CurveAffine> Proof<C> {
 
         // This check ensures the circuit is satisfied so long as the polynomial
         // commitments open to the correct values.
-        self.check_hx(params, vk, beta, gamma, y, x)?;
+        self.check_hx(params, vk, theta, beta, gamma, y, x)?;
 
         for eval in self
             .advice_evals
@@ -85,6 +99,20 @@ impl<'a, C: CurveAffine> Proof<C> {
                     .map(|p| p.evals())
                     .into_iter()
                     .flatten(),
+            )
+            .chain(
+                self.lookup_proofs
+                    .iter()
+                    .flat_map(|proof| {
+                        std::iter::empty()
+                            .chain(Some(proof.product_eval))
+                            .chain(Some(proof.product_inv_eval))
+                            .chain(Some(proof.permuted_input_eval))
+                            .chain(Some(proof.permuted_input_inv_eval))
+                            .chain(Some(proof.permuted_table_eval))
+                    })
+                    .collect::<Vec<_>>()
+                    .iter(),
             )
         {
             transcript.absorb_scalar(*eval);
@@ -128,6 +156,46 @@ impl<'a, C: CurveAffine> Proof<C> {
                             eval,
                         }),
                 );
+
+        // Handle lookup arguments, if any exist
+        for lookup in self.lookup_proofs.iter() {
+            // Open lookup product commitments at x_3
+            queries.push(VerifierQuery {
+                point: x_3,
+                commitment: &lookup.product_commitment,
+                eval: lookup.product_eval,
+            });
+
+            // Open lookup input commitments at x_3
+            queries.push(VerifierQuery {
+                point: x_3,
+                commitment: &lookup.permuted_input_commitment,
+                eval: lookup.permuted_input_eval,
+            });
+
+            // Open lookup table commitments at x_3
+            queries.push(VerifierQuery {
+                point: x_3,
+                commitment: &lookup.permuted_table_commitment,
+                eval: lookup.permuted_table_eval,
+            });
+
+            // Open lookup input commitments at \omega^{-1} x_3
+            let x_3_inv = vk.domain.rotate_omega(x_3, Rotation(-1));
+            queries.push(VerifierQuery {
+                point: x_3_inv,
+                commitment: &lookup.permuted_input_commitment,
+                eval: lookup.permuted_input_inv_eval,
+            });
+
+            // Open lookup product commitments at \omega^{-1} x_3
+            let x_3_inv = vk.domain.rotate_omega(x_3, Rotation(-1));
+            queries.push(VerifierQuery {
+                point: x_3_inv,
+                commitment: &lookup.product_commitment,
+                eval: lookup.product_inv_eval,
+            });
+        }
 
         // We are now convinced the circuit is satisfied so long as the
         // polynomial commitments open to the correct values.
@@ -173,6 +241,10 @@ impl<'a, C: CurveAffine> Proof<C> {
             .map(|p| p.check_lengths(vk))
             .transpose()?;
 
+        if self.lookup_proofs.len() != vk.cs.lookups.len() {
+            return Err(Error::IncompatibleParams);
+        }
+
         // TODO: check h_commitments
 
         if self.advice_commitments.len() != vk.cs.num_advice_columns {
@@ -188,6 +260,7 @@ impl<'a, C: CurveAffine> Proof<C> {
         &self,
         params: &'a Params<C>,
         vk: &VerifyingKey<C>,
+        theta: C::Scalar,
         beta: ChallengeBeta<C::Scalar>,
         gamma: ChallengeGamma<C::Scalar>,
         y: ChallengeY<C::Scalar>,
@@ -221,6 +294,25 @@ impl<'a, C: CurveAffine> Proof<C> {
                     .map(|p| p.expressions(vk, &self.advice_evals, l_0, beta, gamma, x))
                     .into_iter()
                     .flatten(),
+            )
+            .chain(
+                vk.cs
+                    .lookups
+                    .iter()
+                    .zip(self.lookup_proofs.iter())
+                    .flat_map(|(lookup, lookup_proof)| {
+                        lookup_proof.evaluate_lookup_constraints(
+                            &vk.cs,
+                            theta,
+                            beta,
+                            gamma,
+                            l_0,
+                            lookup,
+                            &self.advice_evals,
+                            &self.fixed_evals,
+                            &self.aux_evals,
+                        )
+                    }),
             )
             .fold(C::Scalar::zero(), |h_eval, v| h_eval * &y + &v);
 

@@ -3,6 +3,12 @@ use std::iter;
 use super::{
     circuit::{Advice, Assignment, Circuit, Column, ConstraintSystem, Fixed},
     permutation, ChallengeBeta, ChallengeGamma, ChallengeX, ChallengeY, Error, Proof, ProvingKey,
+    hash_point,
+    lookup::{self, prover::LookupData},
+};
+use crate::arithmetic::{
+    eval_polynomial, get_challenge_scalar, parallelize, BatchInvert, Challenge, Curve, CurveAffine,
+    Field,
 };
 use crate::arithmetic::{eval_polynomial, Curve, CurveAffine, Field};
 use crate::poly::{
@@ -167,6 +173,33 @@ impl<C: CurveAffine> Proof<C> {
             })
             .collect();
 
+        // Sample theta challenge for keeping lookup columns linearly independent
+        let theta: C::Scalar =
+            get_challenge_scalar(Challenge(transcript.squeeze().get_lower_128()));
+
+        // Construct permuted values for each lookup
+        let mut lookups: Vec<LookupData<C>> = pk
+            .vk
+            .cs
+            .lookups
+            .iter()
+            .map(|lookup| LookupData::<C>::new(lookup))
+            .collect();
+
+        for lookup in lookups.iter_mut() {
+            let permuted = lookup.construct_permuted(
+                &pk,
+                &params,
+                &domain,
+                theta,
+                &witness.advice,
+                &pk.fixed_values,
+                &aux,
+            )?;
+            hash_point(&mut transcript, &permuted.permuted_input_commitment)?;
+            hash_point(&mut transcript, &permuted.permuted_table_commitment)?;
+        }
+
         // Sample beta challenge
         let beta = ChallengeBeta::get(&mut transcript);
 
@@ -187,7 +220,21 @@ impl<C: CurveAffine> Proof<C> {
             None
         };
 
-        // Obtain challenge for keeping all separate gates linearly independent
+        for lookup in lookups.iter_mut() {
+            let product = lookup.construct_product(
+                &pk,
+                &params,
+                beta,
+                gamma,
+                theta,
+                &witness.advice,
+                &pk.fixed_values,
+                &aux,
+            );
+            // Hash each lookup product commitment
+            hash_point(&mut transcript, &product.product_commitment)?;
+        }
+
         let y = ChallengeY::<C::Scalar>::get(&mut transcript);
 
         // Evaluate the h(X) polynomial's constraint system expressions for the permutation constraints, if any.
@@ -213,6 +260,23 @@ impl<C: CurveAffine> Proof<C> {
             // Permutation constraints, if any.
             .chain(permutation_expressions.into_iter().flatten())
             .fold(domain.empty_extended(), |h_poly, v| h_poly * *y + &v);
+
+        // Lookups
+        for lookup in lookups.iter_mut() {
+            let constraints = lookup.construct_constraints(
+                &pk,
+                beta,
+                gamma,
+                theta,
+                &advice_cosets,
+                &pk.fixed_cosets,
+                &aux_cosets,
+            );
+            for lookup_constraint_poly in constraints.iter() {
+                h_poly = h_poly * x_2;
+                h_poly = h_poly + &lookup_constraint_poly;
+            }
+        }
 
         // Divide by t(X) = X^{params.n} - 1.
         let h_poly = domain.divide_by_vanishing_poly(h_poly);
@@ -250,6 +314,12 @@ impl<C: CurveAffine> Proof<C> {
         }
 
         let x = ChallengeX::get(&mut transcript);
+
+        let mut lookup_proofs: Vec<lookup::Proof<C>> = Vec::new();
+        for lookup in lookups.iter_mut() {
+            let proof = lookup.construct_proof(&domain, x_3);
+            lookup_proofs.push(proof);
+        }
 
         // Evaluate polynomials at omega^i x
         let advice_evals: Vec<_> = meta
@@ -334,6 +404,50 @@ impl<C: CurveAffine> Proof<C> {
                         }),
                 );
 
+        // Handle lookup arguments, if any exist
+        for (lookup, proof) in lookups.iter().zip(lookup_proofs.iter()) {
+            // Open lookup product commitments at x_3
+            instances.push(ProverQuery {
+                point: x_3,
+                poly: &lookup.product.as_ref().unwrap().product_poly,
+                blind: lookup.product.clone().unwrap().product_blind,
+                eval: proof.product_eval,
+            });
+
+            // Open lookup input commitments at x_3
+            instances.push(ProverQuery {
+                point: x_3,
+                poly: &lookup.permuted.as_ref().unwrap().permuted_input_poly,
+                blind: lookup.permuted.clone().unwrap().permuted_input_blind,
+                eval: proof.permuted_input_eval,
+            });
+
+            // Open lookup table commitments at x_3
+            instances.push(ProverQuery {
+                point: x_3,
+                poly: &lookup.permuted.as_ref().unwrap().permuted_table_poly,
+                blind: lookup.permuted.clone().unwrap().permuted_table_blind,
+                eval: proof.permuted_table_eval,
+            });
+
+            let x_3_inv = domain.rotate_omega(x_3, Rotation(-1));
+            // Open lookup input commitments at \omega^{-1} x_3
+            instances.push(ProverQuery {
+                point: x_3_inv,
+                poly: &lookup.permuted.as_ref().unwrap().permuted_input_poly,
+                blind: lookup.permuted.clone().unwrap().permuted_input_blind,
+                eval: proof.permuted_input_inv_eval,
+            });
+
+            // Open lookup product commitments at \omega^{-1} x_3
+            instances.push(ProverQuery {
+                point: x_3_inv,
+                poly: &lookup.product.as_ref().unwrap().product_poly,
+                blind: lookup.product.clone().unwrap().product_blind,
+                eval: proof.product_inv_eval,
+            });
+        }
+
         let multiopening = multiopen::Proof::create(
             params,
             &mut transcript,
@@ -351,6 +465,7 @@ impl<C: CurveAffine> Proof<C> {
             advice_commitments,
             h_commitments,
             permutations: permutations.map(|p| p.build()),
+            lookup_proofs,
             advice_evals,
             fixed_evals,
             aux_evals,
